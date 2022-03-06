@@ -68,7 +68,7 @@ futures = { version = "0.3", optional = true }
 ahash = { version = "0.7", optional = true }
 
 # parquet support
-parquet2 = { git = "https://github.com/kylebarron/parquet2", branch = "kyle/wasm-compression", optional = true, default_features = false, features = ["stream"] }
+parquet2 = { git = "https://github.com/kylebarron/parquet2", branch = "dev", optional = true, default_features = false, features = ["stream"] }
 
 # avro support
 avro-schema = { version = "0.2", optional = true }
@@ -142,13 +142,6 @@ io_ipc_compression = ["lz4", "zstd"]
 io_flight = ["io_ipc", "arrow-format/flight-data"]
 # base64 + io_ipc because arrow schemas are stored as base64-encoded ipc format.
 io_parquet = ["parquet2", "io_ipc", "base64", "futures", "streaming-iterator", "fallible-streaming-iterator"]
-io_parquet_wasm_compression = [
-    "parquet2/zstd",
-    "parquet2/snappy",
-    "parquet2/gzip",
-    # "parquet2/lz4",
-    "parquet2/brotli",
-]
 io_parquet_compression = [
     "parquet2/zstd",
     "parquet2/snappy",
