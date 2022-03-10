@@ -152,7 +152,7 @@ io_parquet_compression = [
     "parquet2/brotli",
 ]
 io_parquet_compression_wasm = [
-    "parquet2/zstd",
+    # "parquet2/zstd",
     "parquet2/snappy",
     "parquet2/gzip",
     "parquet2/lz4_flex",
