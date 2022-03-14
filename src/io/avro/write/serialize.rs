@@ -1,5 +1,6 @@
-use avro_schema::Schema as AvroSchema;
+use avro_schema::{Record, Schema as AvroSchema};
 
+use crate::bitmap::utils::zip_validity;
 use crate::datatypes::{IntervalUnit, PhysicalType, PrimitiveType};
 use crate::types::months_days_ns;
 use crate::{array::*, datatypes::DataType};
@@ -55,6 +56,110 @@ fn binary_optional<O: Offset>(array: &BinaryArray<O>) -> BoxSerializer {
             if let Some(x) = x {
                 util::zigzag_encode(x.len() as i64, buf).unwrap();
                 buf.extend_from_slice(x);
+            }
+        },
+        vec![],
+    ))
+}
+
+fn list_required<'a, O: Offset>(array: &'a ListArray<O>, schema: &AvroSchema) -> BoxSerializer<'a> {
+    let mut inner = new_serializer(array.values().as_ref(), schema);
+    let lengths = array
+        .offsets()
+        .windows(2)
+        .map(|w| (w[1] - w[0]).to_usize() as i64);
+
+    Box::new(BufStreamingIterator::new(
+        lengths,
+        move |length, buf| {
+            util::zigzag_encode(length, buf).unwrap();
+            let mut rows = 0;
+            while let Some(item) = inner.next() {
+                buf.extend_from_slice(item);
+                rows += 1;
+                if rows == length {
+                    util::zigzag_encode(0, buf).unwrap();
+                    break;
+                }
+            }
+        },
+        vec![],
+    ))
+}
+
+fn list_optional<'a, O: Offset>(array: &'a ListArray<O>, schema: &AvroSchema) -> BoxSerializer<'a> {
+    let mut inner = new_serializer(array.values().as_ref(), schema);
+    let lengths = array
+        .offsets()
+        .windows(2)
+        .map(|w| (w[1] - w[0]).to_usize() as i64);
+    let lengths = zip_validity(lengths, array.validity().as_ref().map(|x| x.iter()));
+
+    Box::new(BufStreamingIterator::new(
+        lengths,
+        move |length, buf| {
+            util::zigzag_encode(length.is_some() as i64, buf).unwrap();
+            if let Some(length) = length {
+                util::zigzag_encode(length, buf).unwrap();
+                let mut rows = 0;
+                while let Some(item) = inner.next() {
+                    buf.extend_from_slice(item);
+                    rows += 1;
+                    if rows == length {
+                        util::zigzag_encode(0, buf).unwrap();
+                        break;
+                    }
+                }
+            }
+        },
+        vec![],
+    ))
+}
+
+fn struct_required<'a>(array: &'a StructArray, schema: &Record) -> BoxSerializer<'a> {
+    let schemas = schema.fields.iter().map(|x| &x.schema);
+    let mut inner = array
+        .values()
+        .iter()
+        .zip(schemas)
+        .map(|(x, schema)| new_serializer(x.as_ref(), schema))
+        .collect::<Vec<_>>();
+
+    Box::new(BufStreamingIterator::new(
+        0..array.len(),
+        move |_, buf| {
+            inner
+                .iter_mut()
+                .for_each(|item| buf.extend_from_slice(item.next().unwrap()))
+        },
+        vec![],
+    ))
+}
+
+fn struct_optional<'a>(array: &'a StructArray, schema: &Record) -> BoxSerializer<'a> {
+    let schemas = schema.fields.iter().map(|x| &x.schema);
+    let mut inner = array
+        .values()
+        .iter()
+        .zip(schemas)
+        .map(|(x, schema)| new_serializer(x.as_ref(), schema))
+        .collect::<Vec<_>>();
+
+    let iterator = zip_validity(0..array.len(), array.validity().as_ref().map(|x| x.iter()));
+
+    Box::new(BufStreamingIterator::new(
+        iterator,
+        move |maybe, buf| {
+            util::zigzag_encode(maybe.is_some() as i64, buf).unwrap();
+            if maybe.is_some() {
+                inner
+                    .iter_mut()
+                    .for_each(|item| buf.extend_from_slice(item.next().unwrap()))
+            } else {
+                // skip the item
+                inner.iter_mut().for_each(|item| {
+                    let _ = item.next().unwrap();
+                });
             }
         },
         vec![],
@@ -297,6 +402,40 @@ pub fn new_serializer<'a>(array: &'a dyn Array, schema: &AvroSchema) -> BoxSeria
                 vec![],
             ))
         }
+
+        (PhysicalType::List, AvroSchema::Array(schema)) => {
+            list_required::<i32>(array.as_any().downcast_ref().unwrap(), schema.as_ref())
+        }
+        (PhysicalType::LargeList, AvroSchema::Array(schema)) => {
+            list_required::<i64>(array.as_any().downcast_ref().unwrap(), schema.as_ref())
+        }
+        (PhysicalType::List, AvroSchema::Union(inner)) => {
+            let schema = if let AvroSchema::Array(schema) = &inner[1] {
+                schema.as_ref()
+            } else {
+                unreachable!("The schema declaration does not match the deserialization")
+            };
+            list_optional::<i32>(array.as_any().downcast_ref().unwrap(), schema)
+        }
+        (PhysicalType::LargeList, AvroSchema::Union(inner)) => {
+            let schema = if let AvroSchema::Array(schema) = &inner[1] {
+                schema.as_ref()
+            } else {
+                unreachable!("The schema declaration does not match the deserialization")
+            };
+            list_optional::<i64>(array.as_any().downcast_ref().unwrap(), schema)
+        }
+        (PhysicalType::Struct, AvroSchema::Record(inner)) => {
+            struct_required(array.as_any().downcast_ref().unwrap(), inner)
+        }
+        (PhysicalType::Struct, AvroSchema::Union(inner)) => {
+            let inner = if let AvroSchema::Record(inner) = &inner[1] {
+                inner
+            } else {
+                unreachable!("The schema declaration does not match the deserialization")
+            };
+            struct_optional(array.as_any().downcast_ref().unwrap(), inner)
+        }
         (a, b) => todo!("{:?} -> {:?} not supported", a, b),
     }
 }
@@ -304,9 +443,22 @@ pub fn new_serializer<'a>(array: &'a dyn Array, schema: &AvroSchema) -> BoxSeria
 /// Whether [`new_serializer`] supports `data_type`.
 pub fn can_serialize(data_type: &DataType) -> bool {
     use DataType::*;
+    match data_type.to_logical_type() {
+        List(inner) => return can_serialize(&inner.data_type),
+        LargeList(inner) => return can_serialize(&inner.data_type),
+        _ => {}
+    };
+
     matches!(
         data_type,
-        Boolean | Int32 | Int64 | Utf8 | Binary | Interval(IntervalUnit::MonthDayNano)
+        Boolean
+            | Int32
+            | Int64
+            | Utf8
+            | Binary
+            | LargeUtf8
+            | LargeBinary
+            | Interval(IntervalUnit::MonthDayNano)
     )
 }
 

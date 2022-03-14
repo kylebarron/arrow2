@@ -26,6 +26,13 @@ fn test_primitive_min_max_1() {
 }
 
 #[test]
+fn decimal() {
+    let a = Int128Array::from(&[None, None, Some(5), Some(2)]);
+    assert_eq!(Some(2), min_primitive(&a));
+    assert_eq!(Some(5), max_primitive(&a));
+}
+
+#[test]
 fn min_max_f32() {
     let a = Float32Array::from(&[None, None, Some(5.0), Some(2.0)]);
     assert_eq!(Some(2.0), min_primitive(&a));
@@ -201,4 +208,14 @@ fn test_binary_min_max_1() {
     let a = BinaryArray::<i32>::from(&[None, None, Some(b"b"), Some(b"a")]);
     assert_eq!(Some("a".as_bytes()), min_binary(&a));
     assert_eq!(Some("b".as_bytes()), max_binary(&a));
+}
+
+#[test]
+fn test_max_not_lexi() {
+    let values = [0, 10, 0, 0, 0, 0, 0, 0, 1, 0];
+    let arr = Int64Array::from_slice(&values);
+
+    let maximum = 10;
+    let out = max_primitive(&arr).unwrap();
+    assert_eq!(out, maximum);
 }

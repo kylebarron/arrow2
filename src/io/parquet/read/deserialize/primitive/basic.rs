@@ -50,16 +50,17 @@ pub(super) struct ValuesDictionary<'a, P>
 where
     P: ParquetNativeType,
 {
-    values: hybrid_rle::HybridRleDecoder<'a>,
-    dict: &'a [P],
+    pub values: hybrid_rle::HybridRleDecoder<'a>,
+    pub dict: &'a [P],
 }
 
 impl<'a, P> ValuesDictionary<'a, P>
 where
     P: ParquetNativeType,
 {
-    fn new(data: &'a [u8], length: usize, dict: &'a PrimitivePageDict<P>) -> Self {
-        let values = utils::dict_indices_decoder(data, length);
+    pub fn new(page: &'a DataPage, dict: &'a PrimitivePageDict<P>) -> Self {
+        let (_, _, indices_buffer) = utils::split_buffer(page);
+        let values = utils::dict_indices_decoder(indices_buffer, page.num_values());
 
         Self {
             dict: dict.values(),
@@ -127,13 +128,20 @@ where
     }
 }
 
-impl<'a, T, P, F> utils::Decoder<'a, T, Vec<T>> for PrimitiveDecoder<T, P, F>
+impl<'a, T> utils::DecodedState<'a> for (Vec<T>, MutableBitmap) {
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+}
+
+impl<'a, T, P, F> utils::Decoder<'a> for PrimitiveDecoder<T, P, F>
 where
     T: NativeType,
     P: ParquetNativeType,
     F: Copy + Fn(P) -> T,
 {
     type State = State<'a, P>;
+    type DecodedState = (Vec<T>, MutableBitmap);
 
     fn build_state(&self, page: &'a DataPage) -> Result<Self::State> {
         let is_optional =
@@ -142,20 +150,14 @@ where
         match (page.encoding(), page.dictionary_page(), is_optional) {
             (Encoding::PlainDictionary | Encoding::RleDictionary, Some(dict), false) => {
                 let dict = dict.as_any().downcast_ref().unwrap();
-                Ok(State::RequiredDictionary(ValuesDictionary::new(
-                    page.buffer(),
-                    page.num_values(),
-                    dict,
-                )))
+                Ok(State::RequiredDictionary(ValuesDictionary::new(page, dict)))
             }
             (Encoding::PlainDictionary | Encoding::RleDictionary, Some(dict), true) => {
                 let dict = dict.as_any().downcast_ref().unwrap();
 
-                let (_, _, values_buffer) = utils::split_buffer(page);
-
                 Ok(State::OptionalDictionary(
                     OptionalPageValidity::new(page),
-                    ValuesDictionary::new(values_buffer, page.num_values(), dict),
+                    ValuesDictionary::new(page, dict),
                 ))
             }
             (Encoding::Plain, _, true) => {
@@ -175,17 +177,20 @@ where
         }
     }
 
-    fn with_capacity(&self, capacity: usize) -> Vec<T> {
-        Vec::<T>::with_capacity(capacity)
+    fn with_capacity(&self, capacity: usize) -> Self::DecodedState {
+        (
+            Vec::<T>::with_capacity(capacity),
+            MutableBitmap::with_capacity(capacity),
+        )
     }
 
     fn extend_from_state(
         &self,
         state: &mut Self::State,
-        values: &mut Vec<T>,
-        validity: &mut MutableBitmap,
+        decoded: &mut Self::DecodedState,
         remaining: usize,
     ) {
+        let (values, validity) = decoded;
         match state {
             State::Optional(page_validity, page_values) => utils::extend_from_decoder(
                 validity,

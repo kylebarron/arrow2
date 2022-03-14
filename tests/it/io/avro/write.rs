@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use arrow2::array::*;
 use arrow2::chunk::Chunk;
 use arrow2::datatypes::*;
@@ -35,10 +37,23 @@ pub(super) fn schema() -> Schema {
             DataType::Interval(IntervalUnit::MonthDayNano),
             true,
         ),
+        Field::new(
+            "list",
+            DataType::List(Box::new(Field::new("item", DataType::Int32, true))),
+            false,
+        ),
+        Field::new(
+            "list nullable",
+            DataType::List(Box::new(Field::new("item", DataType::Int32, true))),
+            true,
+        ),
     ])
 }
 
 pub(super) fn data() -> Chunk<Box<dyn Array>> {
+    let list_dt = DataType::List(Box::new(Field::new("item", DataType::Int32, true)));
+    let list_dt1 = DataType::List(Box::new(Field::new("item", DataType::Int32, true)));
+
     let columns = vec![
         Box::new(Int64Array::from_slice([27, 47])) as Box<dyn Array>,
         Box::new(Int64Array::from([Some(27), None])),
@@ -64,6 +79,24 @@ pub(super) fn data() -> Chunk<Box<dyn Array>> {
             Some(months_days_ns::new(1, 1, 10 * 1_000_000)), // 10 millis
             None,
         ])),
+        Box::new(ListArray::<i32>::new(
+            list_dt,
+            vec![0, 2, 5].into(),
+            Arc::new(PrimitiveArray::<i32>::from([
+                None,
+                Some(1),
+                None,
+                Some(3),
+                Some(4),
+            ])),
+            None,
+        )),
+        Box::new(ListArray::<i32>::new(
+            list_dt1,
+            vec![0, 2, 2].into(),
+            Arc::new(PrimitiveArray::<i32>::from([None, Some(1)])),
+            Some([true, false].into()),
+        )),
     ];
 
     Chunk::new(columns)
@@ -191,6 +224,72 @@ fn check_large_format() -> Result<()> {
     assert_eq!(read_schame, expected_schema);
 
     let expected_data = large_format_expected_data();
+    for (c1, c2) in result.columns().iter().zip(expected_data.columns().iter()) {
+        assert_eq!(c1.as_ref(), c2.as_ref());
+    }
+
+    Ok(())
+}
+
+fn struct_schema() -> Schema {
+    Schema::from(vec![
+        Field::new(
+            "struct",
+            DataType::Struct(vec![
+                Field::new("item1", DataType::Int32, false),
+                Field::new("item2", DataType::Int32, true),
+            ]),
+            false,
+        ),
+        Field::new(
+            "struct nullable",
+            DataType::Struct(vec![
+                Field::new("item1", DataType::Int32, false),
+                Field::new("item2", DataType::Int32, true),
+            ]),
+            true,
+        ),
+    ])
+}
+
+fn struct_data() -> Chunk<Box<dyn Array>> {
+    let struct_dt = DataType::Struct(vec![
+        Field::new("item1", DataType::Int32, false),
+        Field::new("item2", DataType::Int32, true),
+    ]);
+
+    Chunk::new(vec![
+        Box::new(StructArray::new(
+            struct_dt.clone(),
+            vec![
+                Arc::new(PrimitiveArray::<i32>::from_slice([1, 2])),
+                Arc::new(PrimitiveArray::<i32>::from([None, Some(1)])),
+            ],
+            None,
+        )),
+        Box::new(StructArray::new(
+            struct_dt,
+            vec![
+                Arc::new(PrimitiveArray::<i32>::from_slice([1, 2])),
+                Arc::new(PrimitiveArray::<i32>::from([None, Some(1)])),
+            ],
+            Some([true, false].into()),
+        )),
+    ])
+}
+
+#[test]
+fn struct_() -> Result<()> {
+    let write_schema = struct_schema();
+    let write_data = struct_data();
+
+    let data = write_avro(&write_data, &write_schema, None)?;
+    let (result, read_schema) = read_avro(&data, None)?;
+
+    let expected_schema = struct_schema();
+    assert_eq!(read_schema, expected_schema);
+
+    let expected_data = struct_data();
     for (c1, c2) in result.columns().iter().zip(expected_data.columns().iter()) {
         assert_eq!(c1.as_ref(), c2.as_ref());
     }

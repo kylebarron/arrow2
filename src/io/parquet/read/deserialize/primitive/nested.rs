@@ -13,7 +13,7 @@ use crate::{
 use super::super::nested_utils::*;
 use super::super::utils;
 use super::super::DataPages;
-use super::basic::Values;
+use super::basic::{Values, ValuesDictionary};
 
 // The state of a `DataPage` of `Primitive` parquet primitive type
 #[allow(clippy::large_enum_variant)]
@@ -24,8 +24,8 @@ where
 {
     Optional(Optional<'a>, Values<'a, P>),
     Required(Values<'a, P>),
-    //RequiredDictionary(ValuesDictionary<'a, T, P, F>),
-    //OptionalDictionary(Optional<'a>, ValuesDictionary<'a, T, P, F>),
+    RequiredDictionary(ValuesDictionary<'a, P>),
+    OptionalDictionary(Optional<'a>, ValuesDictionary<'a, P>),
 }
 
 impl<'a, P> utils::PageState<'a> for State<'a, P>
@@ -36,8 +36,8 @@ where
         match self {
             State::Optional(optional, _) => optional.len(),
             State::Required(required) => required.len(),
-            //State::RequiredDictionary(required) => required.len(),
-            //State::OptionalDictionary(optional, _) => optional.len(),
+            State::RequiredDictionary(required) => required.len(),
+            State::OptionalDictionary(optional, _) => optional.len(),
         }
     }
 }
@@ -70,32 +70,35 @@ where
     }
 }
 
-impl<'a, T, P, F> utils::Decoder<'a, T, Vec<T>> for PrimitiveDecoder<T, P, F>
+impl<'a, T, P, F> utils::Decoder<'a> for PrimitiveDecoder<T, P, F>
 where
     T: NativeType,
     P: ParquetNativeType,
     F: Copy + Fn(P) -> T,
 {
     type State = State<'a, P>;
+    type DecodedState = (Vec<T>, MutableBitmap);
 
     fn build_state(&self, page: &'a DataPage) -> Result<Self::State> {
         let is_optional =
             page.descriptor().type_().get_basic_info().repetition() == &Repetition::Optional;
 
         match (page.encoding(), page.dictionary_page(), is_optional) {
-            /*(Encoding::PlainDictionary | Encoding::RleDictionary, Some(dict), false) => {
-                todo!()
+            (Encoding::PlainDictionary | Encoding::RleDictionary, Some(dict), false) => {
+                let dict = dict.as_any().downcast_ref().unwrap();
+                Ok(State::RequiredDictionary(ValuesDictionary::new(page, dict)))
             }
             (Encoding::PlainDictionary | Encoding::RleDictionary, Some(dict), true) => {
                 let dict = dict.as_any().downcast_ref().unwrap();
-                Ok(State::OptionalDictionary(OptionalDictionaryPage::new(
-                    page, dict, self.op2,
-                )))
-            }*/
-            (Encoding::Plain, None, true) => {
+                Ok(State::OptionalDictionary(
+                    Optional::new(page),
+                    ValuesDictionary::new(page, dict),
+                ))
+            }
+            (Encoding::Plain, _, true) => {
                 Ok(State::Optional(Optional::new(page), Values::new(page)))
             }
-            (Encoding::Plain, None, false) => Ok(State::Required(Values::new(page))),
+            (Encoding::Plain, _, false) => Ok(State::Required(Values::new(page))),
             _ => Err(utils::not_implemented(
                 &page.encoding(),
                 is_optional,
@@ -106,17 +109,20 @@ where
         }
     }
 
-    fn with_capacity(&self, capacity: usize) -> Vec<T> {
-        Vec::<T>::with_capacity(capacity)
+    fn with_capacity(&self, capacity: usize) -> Self::DecodedState {
+        (
+            Vec::<T>::with_capacity(capacity),
+            MutableBitmap::with_capacity(capacity),
+        )
     }
 
     fn extend_from_state(
         &self,
         state: &mut Self::State,
-        values: &mut Vec<T>,
-        validity: &mut MutableBitmap,
+        decoded: &mut Self::DecodedState,
         remaining: usize,
     ) {
+        let (values, validity) = decoded;
         match state {
             State::Optional(page_validity, page_values) => {
                 let max_def = page_validity.max_def();
@@ -130,10 +136,30 @@ where
                 )
             }
             State::Required(page) => {
-                values.extend(page.values.by_ref().map(decode).map(self.op).take(remaining));
+                values.extend(
+                    page.values
+                        .by_ref()
+                        .map(decode)
+                        .map(self.op)
+                        .take(remaining),
+                );
             }
-            //State::OptionalDictionary(page) => todo!(),
-            //State::RequiredDictionary(page) => todo!(),
+            State::RequiredDictionary(page) => {
+                let op1 = |index: u32| page.dict[index as usize];
+                values.extend(page.values.by_ref().map(op1).map(self.op).take(remaining));
+            }
+            State::OptionalDictionary(page_validity, page_values) => {
+                let max_def = page_validity.max_def();
+                let op1 = |index: u32| page_values.dict[index as usize];
+                read_optional_values(
+                    page_validity.definition_levels.by_ref(),
+                    max_def,
+                    page_values.values.by_ref().map(op1).map(self.op),
+                    values,
+                    validity,
+                    remaining,
+                )
+            }
         }
     }
 }
@@ -207,8 +233,8 @@ where
             &self.decoder,
         );
         match maybe_state {
-            utils::MaybeNext::Some(Ok((nested, values, validity))) => {
-                Some(Ok((nested, finish(&self.data_type, values, validity))))
+            utils::MaybeNext::Some(Ok((nested, state))) => {
+                Some(Ok((nested, finish(&self.data_type, state.0, state.1))))
             }
             utils::MaybeNext::Some(Err(e)) => Some(Err(e)),
             utils::MaybeNext::None => None,

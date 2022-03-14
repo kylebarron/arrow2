@@ -7,10 +7,11 @@ mod nested_utils;
 mod null;
 mod primitive;
 mod simple;
+mod struct_;
 mod utils;
 
 use crate::{
-    array::{Array, BinaryArray, ListArray, StructArray, Utf8Array},
+    array::{Array, BinaryArray, ListArray, Utf8Array},
     datatypes::{DataType, Field},
     error::{ArrowError, Result},
 };
@@ -42,20 +43,27 @@ fn create_list(
 ) -> Result<Arc<dyn Array>> {
     Ok(match data_type {
         DataType::List(_) => {
-            let (offsets, validity) = nested.nested.pop().unwrap().inner();
+            let (mut offsets, validity) = nested.nested.pop().unwrap().inner();
+            offsets.push(values.len() as i64);
 
             let offsets = offsets.iter().map(|x| *x as i32).collect::<Vec<_>>();
             Arc::new(ListArray::<i32>::new(
                 data_type,
                 offsets.into(),
                 values,
-                validity,
+                validity.and_then(|x| x.into()),
             ))
         }
         DataType::LargeList(_) => {
-            let (offsets, validity) = nested.nested.pop().unwrap().inner();
+            let (mut offsets, validity) = nested.nested.pop().unwrap().inner();
+            offsets.push(values.len() as i64);
 
-            Arc::new(ListArray::<i64>::new(data_type, offsets, values, validity))
+            Arc::new(ListArray::<i64>::new(
+                data_type,
+                offsets.into(),
+                values,
+                validity.and_then(|x| x.into()),
+            ))
         }
         _ => {
             return Err(ArrowError::NotYetImplemented(format!(
@@ -64,50 +72,6 @@ fn create_list(
             )))
         }
     })
-}
-
-struct StructIterator<'a> {
-    iters: Vec<NestedArrayIter<'a>>,
-    fields: Vec<Field>,
-}
-
-impl<'a> StructIterator<'a> {
-    pub fn new(iters: Vec<NestedArrayIter<'a>>, fields: Vec<Field>) -> Self {
-        assert_eq!(iters.len(), fields.len());
-        Self { iters, fields }
-    }
-}
-
-impl<'a> Iterator for StructIterator<'a> {
-    type Item = Result<(NestedState, Arc<dyn Array>)>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        let values = self
-            .iters
-            .iter_mut()
-            .map(|iter| iter.next())
-            .collect::<Vec<_>>();
-
-        if values.iter().any(|x| x.is_none()) {
-            return None;
-        }
-        let values = values
-            .into_iter()
-            .map(|x| x.unwrap().map(|x| x.1))
-            .collect::<Result<Vec<_>>>();
-
-        match values {
-            Ok(values) => Some(Ok((
-                NestedState::new(vec![]), // todo
-                Arc::new(StructArray::from_data(
-                    DataType::Struct(self.fields.clone()),
-                    values,
-                    None,
-                )),
-            ))),
-            Err(e) => Some(Err(e)),
-        }
-    }
 }
 
 fn columns_to_iter_recursive<'a, I: 'a>(
@@ -226,7 +190,7 @@ where
                 })
                 .collect::<Result<Vec<_>>>()?;
             let columns = columns.into_iter().rev().collect();
-            Box::new(StructIterator::new(columns, fields.clone()))
+            Box::new(struct_::StructIterator::new(columns, fields.clone()))
         }
         _ => todo!(),
     })
